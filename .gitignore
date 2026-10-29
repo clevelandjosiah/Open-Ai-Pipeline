@@ -1,0 +1,38 @@
+# Terraform working directory
+.terraform/
+
+# State files
+*.tfstate
+*.tfstate.*
+
+# Plan files
+*.tfplan
+tfplan
+
+# Variable files with real values
+*.tfvars
+*.tfvars.json
+# Exception: commit the safe template
+!terraform.tfvars.example
+
+# Crash logs
+crash.log
+crash.*.log
+
+# Override files
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+
+# Do NOT ignore .terraform.lock.hcl, commit it
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/

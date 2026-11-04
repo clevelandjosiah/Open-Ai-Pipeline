@@ -17,7 +17,7 @@ env:
   TF_VERSION: "1.10.5"
   WORKING_DIR: "terraform/foundation"
   AWS_REGION: "us-east-1"
-  BEDROCK_MODEL_ID: "us.amazon.nova-micro-v1:0"
+  AI_MODEL: "gpt-4o-mini"
 
 jobs:
   # ── JOB 1: Security Scan ─────────────────────────────
@@ -81,6 +81,7 @@ jobs:
 
       - name: Run AI Remediation
         env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: python scripts/remediate_ai.py

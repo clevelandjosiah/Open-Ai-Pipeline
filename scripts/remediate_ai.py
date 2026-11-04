@@ -1,14 +1,13 @@
 import os, json, time
-import boto3, requests
+import requests
+from openai import OpenAI
 
-model_id  = os.environ["BEDROCK_MODEL_ID"]
-region    = os.environ.get("AWS_REGION", "us-east-1")
+model     = os.environ["AI_MODEL"]
 gh_token  = os.environ["GITHUB_TOKEN"]
 repo      = os.environ["GITHUB_REPOSITORY"]
 pr_number = os.environ.get("PR_NUMBER")
 
-bedrock = boto3.client("bedrock-runtime", region_name=region)
-
+client = OpenAI()  # reads OPENAI_API_KEY from the environment automatically
 
 def get_ai_fix(check_id, resource, file_path, guideline):
     prompt = (
@@ -19,15 +18,19 @@ def get_ai_fix(check_id, resource, file_path, guideline):
         "**Why this matters:** <one sentence>"
     )
     try:
-        resp = bedrock.converse(
-            modelId=model_id,
-            system=[{"text": "You are a DevSecOps engineer specializing in Terraform and AWS security. Be concise."}],
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            inferenceConfig={"maxTokens": 600, "temperature": 0.1},
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a DevSecOps engineer specializing in Terraform and AWS security. Be concise."},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=600,
+            temperature=0.1,
+            timeout=30,
         )
-        return resp["output"]["message"]["content"][0]["text"]
+        return resp.choices[0].message.content
     except Exception as e:
-        print(f"Bedrock error for {check_id}: {e}")
+        print(f"OpenAI error for {check_id}: {e}")
         return None
 
 

@@ -1,6 +1,6 @@
 # AWS Terraform DevSecOps Pipeline with AI Remediation
 
-**Status:** 🚧 In progress: pipeline, security gate, and AI remediation are working on AWS (us-east-1). Remaining Checkov findings are not fixed yet, so the pipeline's deploy job hasn't run on `main`.
+**Status:** ✅ Complete: built, tested, and deployed on AWS (us-east-1) through the pipeline, with branch protection on `main`.
 
 ## Video Walkthrough
 
@@ -9,6 +9,8 @@
 ## Project Overview
 
 I built a GitHub Actions pipeline that deploys AWS infrastructure with Terraform behind a real security gate. Every pull request is scanned by Checkov before Terraform is allowed to plan. Findings go to GitHub code scanning as SARIF, and failing PRs get an AI-generated remediation comment from the OpenAI API. Pushes to `main` run the same gate, and `terraform apply` only runs on `main` after the scan passes.
+
+The project started from a 3-day Azure bootcamp guide. I rebuilt it on AWS, which meant replacing Azure login with AWS OIDC, Azure Blob state with S3 state, and Azure OpenAI with a different AI provider.
 
 How credentials are handled:
 
@@ -24,6 +26,7 @@ How credentials are handled:
 - **Debugging OIDC with CloudTrail:** found the exact `sub` claim GitHub sent by reading the rejected `AssumeRoleWithWebIdentity` event.
 - **Policy-as-code security gate:** Checkov with no `soft_fail`, plus SARIF results in GitHub code scanning.
 - **Python automation:** the remediation script reads real scan output, de-duplicates findings, rate-limits calls, and posts a single PR comment.
+- **Working around cloud AI quotas:** diagnosed a zero Bedrock quota with Service Quotas, filed a support case, and switched providers when it was denied.
 
 ## Architecture Diagram
 
@@ -42,7 +45,7 @@ flowchart LR
     subgraph AWS[AWS us-east-1]
         role[IAM role<br/>github-actions-oaip]
         state[(S3 state bucket<br/>versioned, use_lockfile)]
-        lab[S3 lab bucket<br/>oaip-dev-suffix]
+        lab[S3 lab bucket<br/>oaib-dev-cae28e44]
     end
 
     plan -->|OIDC| role
@@ -66,9 +69,9 @@ flowchart LR
 |---|---|
 | GitHub repository | `clevelandjosiah/Open-Ai-Pipeline` |
 | Terraform root folder | `terraform/foundation` |
-| State bucket | `<openai-tfstate>` (created by hand, globally unique) |
+| State bucket | `openai-tfstate` (created by hand, globally unique) |
 | State key | `foundation/terraform.tfstate` |
-| Lab bucket | `oaip-dev-<8-char hex suffix>` |
+| Lab bucket | `oaib-dev-cae28e44` (prefix `oaib`, environment `dev`, random 8-char hex suffix) |
 | IAM role | `github-actions-oaip` |
 | OIDC provider | `token.actions.githubusercontent.com` |
 | AI model | `gpt-4o-mini` (OpenAI API) |
@@ -96,8 +99,8 @@ Some things have to exist before Terraform or the pipeline can run: somewhere to
 
 ```bash
 aws sts get-caller-identity
-aws s3api create-bucket --bucket <your-state-bucket> --region us-east-1
-aws s3api put-bucket-versioning --bucket <your-state-bucket> \
+aws s3api create-bucket --bucket openai-tfstate --region us-east-1
+aws s3api put-bucket-versioning --bucket openai-tfstate \
   --versioning-configuration Status=Enabled
 ```
 
@@ -175,7 +178,7 @@ The configuration lives in [`terraform/foundation/`](terraform/foundation/). A f
 ```hcl
 terraform {
   backend "s3" {
-    bucket       = "<your-state-bucket>"
+    bucket       = "openai-tfstate"
     key          = "foundation/terraform.tfstate"
     region       = "us-east-1"
     encrypt      = true
@@ -253,14 +256,27 @@ On the lab bucket it reported 11 findings:
 
 | Check | What it wants | Status |
 |---|---|---|
-| CKV_AWS_53, CKV_AWS_54, CKV_AWS_55, CKV_AWS_56 | The four public access block settings enabled | Intentional vulnerability, fix pending |
-| CKV_AWS_21 | Versioning on the bucket | Open |
-| CKV_AWS_145 | KMS encryption by default | Open |
-| CKV_AWS_18 | Access logging | Open |
-| CKV2_AWS_61 | A lifecycle configuration | Open |
-| CKV2_AWS_62 | Event notifications | Open, likely a documented skip for a lab bucket |
-| CKV_AWS_144 | Cross-region replication | Open, likely a documented skip for a lab bucket |
-| CKV2_AWS_6 | A public access block resource | Open |
+| CKV_AWS_53, CKV_AWS_54, CKV_AWS_55, CKV_AWS_56 | The four public access block settings enabled | Fixed: all four set to `true` |
+| CKV2_AWS_6 | A public access block resource | Fixed by the same change |
+| CKV_AWS_21 | Versioning on the bucket | Fixed: added `aws_s3_bucket_versioning` |
+| CKV_AWS_145 | KMS encryption by default | Skipped: default SSE-S3 encryption is enough for a lab bucket, and KMS adds key cost |
+| CKV_AWS_18 | Access logging | Skipped: needs a second log bucket, out of scope for this lab |
+| CKV2_AWS_61 | A lifecycle configuration | Skipped: the lab bucket holds no data |
+| CKV2_AWS_62 | Event notifications | Skipped: no downstream consumers |
+| CKV_AWS_144 | Cross-region replication | Skipped: out of scope for a single-region lab |
+
+The skips are inline `checkov:skip` comments on the bucket resource, each with its reason, so every exception is documented next to the code it applies to:
+
+```hcl
+resource "aws_s3_bucket" "lab" {
+  # checkov:skip=CKV_AWS_145:Default SSE-S3 encryption is enough for a lab bucket; KMS adds key cost
+  # checkov:skip=CKV_AWS_18:Access logging needs a second log bucket, out of scope for this lab
+  # checkov:skip=CKV2_AWS_61:Lab bucket holds no data, so no lifecycle rules are needed
+  # checkov:skip=CKV2_AWS_62:No downstream consumers for event notifications
+  # checkov:skip=CKV_AWS_144:Cross-region replication is out of scope for a single-region lab
+  bucket = "${var.prefix}-${var.environment}-${random_id.suffix.hex}"
+}
+```
 
 ### 6. The pipeline
 
@@ -330,16 +346,33 @@ The job only suggests fixes. It never edits code or commits, and the workflow do
 
 ### 7. First deploy
 
-> **Pending.** The pipeline's first deploy runs once the scan passes. This section will cover the first push to `main` that runs scan → plan → apply, with screenshots of the run and the deployed resources.
+Before the first pipeline deploy, I destroyed the lab bucket I had applied locally, so the pipeline would create everything from scratch:
 
-<!-- ![Successful run with scan and deploy green](screenshots/07-run-success.png) -->
-<!-- ![Terraform apply complete in the pipeline](screenshots/07-apply-complete.png) -->
-<!-- ![Deployed lab bucket in the S3 console](screenshots/07-lab-bucket.png) -->
-<!-- ![Lab bucket permissions: all public access blocked](screenshots/07-public-access-blocked.png) -->
+```bash
+cd terraform/foundation
+terraform destroy
+```
+
+Then I opened PR #5 with the Checkov fixes from step 5:
+
+```bash
+git checkout -b fix/checkov-findings
+git add terraform/foundation/main.tf
+git commit -m "fix: resolve checkov findings on lab bucket"
+git push -u origin fix/checkov-findings
+```
+
+On the PR, the scan passed, the AI job was skipped, and `Terraform Deploy` ran the plan: 4 to add. Apply was skipped, because it only runs on a push to `main`. After I merged, the push to `main` ran the same flow and applied the saved plan:
+
+![Terraform apply in the pipeline: 4 added](screenshots/07-apply-complete.png)
+
+The pipeline created the `random_id` suffix, the bucket `oaib-dev-cae28e44`, its versioning configuration, and its public access block, all through OIDC with no stored AWS keys. The S3 console confirms the fix reached AWS:
+
+![Lab bucket oaib-dev-cae28e44: Block all public access is On](screenshots/07-public-access-blocked.png)
 
 ### 8. Branch protection
 
-> **Pending.** This ruleset gets applied once the scan passes. Until then, PRs with failing checks can still be merged, which is how PR #1 was merged. Turning it on earlier would block every merge, README changes included.
+I applied this after the scan was passing. Before that, PRs with failing checks could still be merged, which is how PR #1 got in.
 
 With the job names registered by the first runs, `main` requires a pull request, a passing `Checkov Security Scan`, and no force pushes:
 
@@ -386,9 +419,6 @@ rm /tmp/ruleset.json
 
 `Terraform Deploy` isn't a required check on purpose. When the scan fails, deploy is skipped, and GitHub treats a skipped required check as passing, so requiring it would add nothing.
 
-<!-- Screenshot: ruleset on main -->
-<!-- Screenshot: PR merge blocked by the failing scan -->
-
 Rulesets enforce on public repos with GitHub Free, which is another reason this repo is public.
 
 ### 9. Break and fix: watching the gate work
@@ -411,7 +441,9 @@ What happened:
 5. **After switching to OpenAI, the comment had real suggestions.** The public access block fix was correct: all four settings set to `true`.
 6. **It also had two problems.** Findings 1 to 4 were the same fix repeated, because Checkov has a separate rule for each of the four settings, and the script sends each one separately. And the suggestion for CKV2_AWS_61 was wrong: it described logging, not lifecycle, in outdated syntax. The script only sent the check ID, so the model guessed what the check meant. That's exactly why the pipeline posts suggestions as comments for a human to review instead of committing them.
 
-The remaining fixes, including applying the public access block correction and documenting skips for the checks that don't fit a lab bucket, are next.
+7. **I fixed what fit and skipped what didn't.** The public access block went to `true`, versioning was added, and the five checks that don't fit a lab bucket were skipped with written reasons (step 5).
+8. **The first validate failed.** When I added the skips, I accidentally removed the `random_id` resource, and `terraform validate` failed in the pipeline. Restoring it fixed the run.
+9. **The scan passed, the plan showed 4 to add, and the merge deployed it** (step 7).
 
 ![CloudTrail event showing the sub claim GitHub sent](screenshots/09-cloudtrail-sub.png)
 
@@ -419,7 +451,7 @@ The remaining fixes, including applying the public access block correction and d
 
 ![Checkov findings in code scanning](screenshots/09-code-scanning-alerts.png)
 
-![First AI remediation comment, empty because every Bedrock call failed](screenshots/09-ai-comment-before.png)
+<!-- ![First AI remediation comment, empty because every Bedrock call failed](screenshots/09-ai-comment-before.png) -->
 
 ![AI remediation comment from OpenAI with suggested fixes](screenshots/09-ai-comment-after.png)
 
@@ -432,10 +464,11 @@ The remaining fixes, including applying the public access block correction and d
 - [x] A PR with findings fails the scan, and `Terraform Deploy` is skipped
 - [x] Checkov SARIF results appear in the Security tab under code scanning
 - [x] The AI remediation job posts a comment with suggested fixes on a failing PR
-- [ ] The public access block fix is applied, and the remaining findings are fixed or skipped with a documented reason
-- [ ] The scan passes and `terraform plan` runs in the pipeline
-- [ ] A push to `main` runs scan → plan → apply
-- [ ] Branch protection requires the scan to pass before merging
+- [x] The public access block fix is applied, and the remaining findings are fixed or skipped with a documented reason
+- [x] The scan passes and `terraform plan` runs in the pipeline
+- [x] A push to `main` runs scan → plan → apply
+- [x] The deployed bucket shows Block all public access: On
+- [x] Branch protection requires the scan to pass before merging
 - [ ] The IAM role uses a least-privilege policy instead of `AmazonS3FullAccess`
 
 ## Troubleshooting
@@ -453,6 +486,8 @@ The remaining fixes, including applying the public access block correction and d
 | `gh: command not found` after `pip3 install gh` | The pip package named `gh` is unrelated to the GitHub CLI | Uninstalled it, and used `brew install gh` or the GitHub website |
 | `code: command not found` | The VS Code shell command wasn't on the PATH | VS Code → Cmd+Shift+P → *Shell Command: Install 'code' command in PATH* |
 | `Set-Alias: command not found` | `Set-Alias` is PowerShell, and the Mac terminal runs zsh | `alias tf='terraform'` in `~/.zshrc` |
+| `terraform validate` failed with `A managed resource "random_id" "suffix" has not been declared` | The `random_id` block was deleted while adding the Checkov skips | Restored the resource; ran `terraform validate` locally before pushing |
+| A run on `main` showed `Apply complete! Resources: 0 added` | A second push to `main` ran after the merge, and the first run had already created everything | Normal: found the merge run, which showed 4 added |
 | The `.gitignore` exception for `terraform.tfvars.example` didn't work | An inline comment on the `!` line became part of the pattern | Moved the comment onto its own line |
 
 ## Cleanup
@@ -463,7 +498,7 @@ terraform destroy
 cd ../..
 
 # The state bucket is versioned: empty it in the S3 console (which removes all versions), then delete it
-aws s3api delete-bucket --bucket <your-state-bucket> --region us-east-1
+aws s3api delete-bucket --bucket openai-tfstate --region us-east-1
 
 aws iam detach-role-policy --role-name github-actions-oaip \
   --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess

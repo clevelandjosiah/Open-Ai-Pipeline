@@ -1,580 +1,432 @@
-# AI-Powered Terraform CI/CD Pipeline on AWS
+# Azure Terraform DevSecOps Pipeline
 
-A pull-request pipeline where Checkov scans Terraform code for security issues, and AI suggests fixes, before anything reaches AWS.
+**Status:** ✅ Complete: built, tested, and deployed on Azure (East US 2)
 
-Every pull request (PR) runs a Checkov security scan. If the scan fails, the findings are sent to the OpenAI API (gpt-4o-mini), and the AI posts suggested Terraform fixes as a comment on the PR. Infrastructure is only deployed (`terraform apply`) after the PR passes the scan and is merged into `main`. GitHub authenticates to AWS with OIDC, so no AWS access keys are stored anywhere.
+## Video Walkthrough
 
-## Table of Contents
+> 🎥 Loom walkthrough coming soon.
 
-- [Architecture](#architecture)
-- [Tech Stack](#tech-stack)
-- [Repository Structure](#repository-structure)
-- [Prerequisites](#prerequisites)
-- [Step-by-Step Build](#step-by-step-build)
-- [How the Pipeline Works](#how-the-pipeline-works)
-- [Result](#result)
-- [Troubleshooting Log](#troubleshooting-log)
-- [Lessons Learned](#lessons-learned)
-- [Next Improvements](#next-improvements)
+## Project Overview
 
-## Architecture
+I built a GitHub Actions pipeline that deploys Azure infrastructure with Terraform behind a real security gate. Every pull request is scanned by Checkov before Terraform is allowed to plan. Findings go to GitHub code scanning as SARIF, and failing PRs get an AI-generated remediation comment from an Azure OpenAI model that the same pipeline deployed. Merges to `main` produce a saved plan that only applies after I approve it on the `dev` environment.
+
+Nothing in the pipeline uses a stored credential:
+
+- **GitHub to Azure:** GitHub Actions authenticates with OIDC federated credentials, so no client secret exists.
+- **Terraform state:** state lives in a storage account with shared key access disabled.
+- **Azure OpenAI:** API keys are turned off on the account, and every caller, including the pipeline and my local API wrapper, uses an Entra ID token.
+
+### Skills Demonstrated
+
+- **Terraform on Azure:** Terraform with the azurerm 4.x provider, remote state in Azure Blob Storage with Entra ID auth, and a committed lock file for both Windows and Linux.
+- **CI/CD design:** a multi-job GitHub Actions pipeline with job dependencies, a concurrency lock on state, PR plan comments, and a saved plan that is applied exactly as reviewed.
+- **Keyless authentication:** workload identity federation (OIDC) between GitHub and Microsoft Entra ID, with a separate federated credential for PRs, `main`, and the `dev` environment.
+- **Least-privilege RBAC:** the pipeline identity is scoped to one resource group, with data-plane roles only where it needs them.
+- **Policy-as-code security gate:** Checkov with a documented exception list, plus SARIF results in GitHub code scanning.
+- **Azure OpenAI deployed as code:** the account and model deployment are Terraform resources, local auth is disabled, and calls are authenticated by token.
+- **Python automation:** the remediation script reads real scan output, de-duplicates findings, rate-limits calls, and updates a single PR comment in place.
+- **Observability:** blob read, write, and delete logs sent to a Log Analytics workspace through a diagnostic setting.
+- **Change control:** a GitHub environment with a required reviewer, plus branch protection with required status checks.
+
+## Architecture Diagram
 
 ```mermaid
 flowchart LR
-    A[Pull request opened or updated] --> B[Checkov scan]
-    B -- fails --> C[AI remediation: OpenAI posts fixes on PR]
-    B -- passes --> D[Terraform init, fmt, validate, plan]
-    E[Merge to main] --> B
-    D -- push to main only --> F[Terraform apply via OIDC]
-    F --> G[(AWS: S3)]
-```
+    dev[Developer] -->|push or PR| gh[GitHub repository]
+    gh --> scan[Checkov security gate]
+    scan -->|SARIF| cs[GitHub code scanning]
+    scan -->|fails on PR| ai[AI remediation job]
+    ai -->|PR comment| pr[Pull request]
+    scan -->|passes| plan[Terraform plan]
+    plan -->|plan comment| pr
+    plan -->|main only| approve{dev environment approval}
+    approve --> apply[Terraform apply]
 
-Three jobs:
+    subgraph Azure
+        state[(Remote state<br/>stanthonyclevelandtfstate)]
+        subgraph rg[rg-devsecops-anthonycleveland-dev]
+            st[Storage account]
+            law[Log Analytics workspace]
+            aoai[Azure OpenAI<br/>local auth disabled]
+        end
+    end
 
-| Job | Trigger | What happens |
-| --- | --- | --- |
-| Scan | Every PR and every push to `main` | Checkov scans the Terraform. Findings upload to GitHub Security. A failure blocks deploy. |
-| AI Remediation | Scan fails on a PR | Checkov findings are sent to OpenAI, and suggested fixes are posted as a PR comment |
-| Deploy | Scan passes | `init`, `fmt -check`, `validate`, `plan` on PRs. `apply` only on a push to `main`. |
-
-## Tech Stack
-
-| Tool | Purpose |
-| --- | --- |
-| Terraform | Infrastructure as Code (IaC): defines AWS resources in code files |
-| AWS | Cloud platform where resources are created |
-| Amazon S3 | Holds the Terraform remote state (with native S3 locking) and the lab bucket |
-| AWS IAM + OIDC | Lets GitHub Actions assume an IAM role with short-lived credentials, no stored keys |
-| Checkov | Static security scanner for Terraform |
-| OpenAI API (gpt-4o-mini) | AI model that suggests fixes for Checkov findings |
-| GitHub Actions | CI/CD (continuous integration / continuous delivery) engine that runs the pipeline |
-| GitHub Code Scanning | Displays Checkov results (SARIF) in the repo's Security tab |
-| Python | Script that calls the AI and posts the PR comment |
-| Git | Version control, feature-branch workflow |
-
-## Repository Structure
-
-```
-Open-Ai-Pipeline/
-├── .github/
-│   └── workflows/
-│       └── terraform.yml          # Pipeline definition
-├── .vscode/
-│   └── settings.json              # Shared editor settings (format on save, rulers)
-├── terraform/
-│   └── foundation/
-│       ├── backend.tf             # S3 remote state
-│       ├── versions.tf            # Terraform and provider pins, AWS provider
-│       ├── variables.tf           # Region, prefix, environment, tags
-│       ├── main.tf                # Lab S3 bucket (intentionally insecure)
-│       ├── outputs.tf             # Bucket name and ARN
-│       └── .terraform.lock.hcl    # Locks provider versions
-├── scripts/
-│   └── remediate_ai.py            # AI security remediation
-├── requirements.txt               # Python dependencies
-├── .gitignore                     # Keeps state, plans, tfvars, and providers out of Git
-└── README.md
+    ai -->|Entra token via OIDC| aoai
+    plan --> state
+    apply --> state
+    apply --> st
+    apply --> aoai
+    st -->|blob logs| law
 ```
 
 ## Prerequisites
 
-- AWS account
-- AWS CLI v2 installed and signed in: `aws sts get-caller-identity`
-- Terraform 1.10 or newer (required for native S3 state locking): `terraform --version`
-- Git and a GitHub account
-- OpenAI API account with prepaid credits
-- VS Code with the HashiCorp Terraform extension (optional)
+- An Azure subscription where I can create role assignments (Owner, or Contributor plus User Access Administrator)
+- Azure OpenAI available in the subscription, with quota for a small `GlobalStandard` model deployment in East US 2
+- Azure CLI, Terraform 1.9 or later, GitHub CLI, Python 3.12, VS Code
+- PowerShell on Windows
+- A GitHub account (the repo is public, so code scanning and environment reviewers are free)
 
-## Step-by-Step Build
+## Naming Conventions
 
-### Step 1: Set up the repo and `.gitignore`
+| Resource | Name |
+|---|---|
+| State resource group | `rg-tfstate-anthonycleveland` |
+| State storage account | `stanthonyclevelandtfstate` |
+| State container / key | `tfstate` / `devsecops-pipeline.tfstate` |
+| Workload resource group | `rg-devsecops-anthonycleveland-dev` |
+| Workload storage account | `stanthonycleveland<8-char suffix>` |
+| Azure OpenAI account | `oai-devsecops-anthonycleveland-<8-char suffix>` |
+| Log Analytics workspace | `log-devsecops-anthonycleveland-<8-char suffix>` |
+| Blob diagnostic setting | `blob-to-log-analytics` |
+| Model deployment | `chat` |
+| App registration | `github-actions-devsecops-pipeline` |
+| GitHub environment | `dev` |
+| Region | East US 2 (`eastus2`) |
 
-Create the repo locally and on GitHub, then link them.
+## Project Steps
 
-```bash
+### 1. Create the repository
+
+```powershell
+cd azure-terraform-devsecops-pipeline
 git init -b main
-git remote add origin https://github.com/<your-user>/Open-Ai-Pipeline.git
+gh repo create anthonycleveland/azure-terraform-devsecops-pipeline --public `
+  --description "Terraform on Azure through GitHub Actions: OIDC auth, Checkov security gate, and AI remediation with Azure OpenAI" `
+  --source . --remote origin
 ```
 
-Create `.gitignore` before any Terraform files exist, so state and secrets can never be committed:
+### 2. Bootstrap Azure and GitHub
 
-```gitignore
-# Terraform working directory
-.terraform/
+Some things have to exist before Terraform can run: somewhere to keep state, an identity for the pipeline, and its permissions. I put all of that in one idempotent script, [`bootstrap/bootstrap.ps1`](bootstrap/bootstrap.ps1).
 
-# State files
-*.tfstate
-*.tfstate.*
-
-# Plan files
-*.tfplan
-tfplan
-
-# Variable files with real values
-*.tfvars
-*.tfvars.json
-# Exception: commit the safe template
-!terraform.tfvars.example
-
-# Crash logs
-crash.log
-crash.*.log
-
-# Override files
-override.tf
-override.tf.json
-*_override.tf
-*_override.tf.json
-
-# Do NOT ignore .terraform.lock.hcl, commit it
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Python
-__pycache__/
-*.pyc
-.env
-venv/
+```powershell
+az login
+gh auth login
+powershell -ExecutionPolicy Bypass -File .\bootstrap\bootstrap.ps1
 ```
 
-```bash
-git add .gitignore
-git commit -m "chore: initial repository setup"
+What it creates:
+
+- **Remote state:** `rg-tfstate-anthonycleveland` and `stanthonyclevelandtfstate`, with shared key access disabled, TLS 1.2, and no public blob access. It also creates the `tfstate` container and grants me `Storage Blob Data Contributor`.
+- **Workload resource group:** `rg-devsecops-anthonycleveland-dev`. Terraform reads it as a data source instead of creating it, which is what lets the pipeline identity be scoped to it.
+- **App registration** `github-actions-devsecops-pipeline`, with three federated credentials. No client secret is ever created. Each GitHub context gets its own credential because the OIDC token's `subject` claim differs:
+
+| Federated credential | Subject | Used by |
+|---|---|---|
+| `github-pull-requests` | `repo:anthonycleveland@177060158/azure-terraform-devsecops-pipeline@1436092606:pull_request` | PR plan and AI remediation |
+| `github-main-branch` | `repo:anthonycleveland@177060158/azure-terraform-devsecops-pipeline@1436092606:ref:refs/heads/main` | Plan on `main` |
+| `github-env-dev` | `repo:anthonycleveland@177060158/azure-terraform-devsecops-pipeline@1436092606:environment:dev` | Apply (runs in the `dev` environment) |
+
+GitHub issues immutable subjects for repositories created after mid-2026. The owner and repo names carry their numeric IDs (`owner@ownerId/repo@repoId`), so if this repo were ever deleted or renamed, someone else couldn't claim the name and inherit its access to Azure. The bootstrap reads those IDs from the GitHub API rather than hardcoding them.
+
+- **Least-privilege roles:**
+
+| Principal | Role | Scope |
+|---|---|---|
+| Pipeline identity | Contributor | Workload resource group |
+| Pipeline identity | Storage Blob Data Contributor | State storage account |
+| Pipeline identity | Cognitive Services OpenAI User | Workload resource group |
+| Me | Storage Blob Data Contributor | State storage account |
+| Me | Cognitive Services OpenAI User | Workload resource group |
+
+- **GitHub config:** repo secrets `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, and `AZURE_SUBSCRIPTION_ID`. These are identifiers, not credentials. It also creates a `dev` environment with me as the required reviewer.
+
+![App registration with three federated credentials and zero client secrets](screenshots/02-federated-credentials.png)
+
+![Role assignments on rg-devsecops-anthonycleveland-dev](screenshots/02-role-assignments.png)
+
+### 3. Terraform configuration
+
+The configuration lives in [`terraform/`](terraform/). A few decisions worth calling out:
+
+```hcl
+provider "azurerm" {
+  features {}
+  subscription_id                 = var.subscription_id
+  resource_provider_registrations = "none"
+}
+```
+
+The pipeline identity has no subscription-level rights, so the provider can't auto-register resource providers. Bootstrap registers the four providers this configuration uses (`Microsoft.Storage`, `Microsoft.CognitiveServices`, `Microsoft.OperationalInsights`, and `Microsoft.Insights`) once instead.
+
+```hcl
+resource "azurerm_cognitive_account" "openai" {
+  kind                  = "OpenAI"
+  custom_subdomain_name = "oai-devsecops-anthonycleveland-${local.suffix}"
+  local_auth_enabled    = false
+  # ...
+}
+```
+
+With `local_auth_enabled = false`, the account rejects API keys entirely. Entra ID token auth requires a custom subdomain, which is why `custom_subdomain_name` is set. This setup removes any need for a Key Vault to hold an API key, because no key is ever used.
+
+### 4. Initialize locally and commit the lock file
+
+```powershell
+cd terraform
+Copy-Item terraform.tfvars.example terraform.tfvars
+# Set subscription_id in terraform.tfvars
+terraform init
+terraform providers lock -platform=windows_amd64 -platform=linux_amd64
+terraform fmt -recursive
+terraform validate
+terraform plan "-out=main.tfplan"
+cd ..
+```
+
+I locked providers for both platforms because I develop on Windows and the pipeline runs on Linux. Without both hashes in `.terraform.lock.hcl`, `terraform init` on the runner would fail. I don't apply locally: the pipeline owns every apply.
+
+![Terraform plan in the pipeline: 4 to add, 0 to change, 0 to destroy](screenshots/04-plan-summary.png)
+
+### 5. The security gate
+
+Checkov runs with no `soft_fail`, so any failed check blocks the run. I hardened the storage account to pass as many checks as possible:
+
+- TLS 1.2 only
+- HTTPS only
+- No public blob access
+- Local users disabled
+- 7-day blob and container soft delete
+- A SAS expiration policy
+
+I also restricted outbound network access on the Azure OpenAI account with an empty allow-list (`outbound_network_access_restricted = true`, no `fqdns`). Checkov's CKV_AZURE_247 only passes when at least one allowed FQDN is listed, so it flags this stricter configuration. I documented it as a false positive rather than allowing a domain the model doesn't need just to satisfy the scanner.
+
+The remaining exceptions are in [`.checkov.yaml`](.checkov.yaml), each with a written reason:
+
+| Check | What it wants | Why it's skipped here |
+|---|---|---|
+| CKV_AZURE_59, CKV_AZURE_35, CKV2_AZURE_33 | Storage with no public network path | GitHub-hosted runners reach Azure over the internet. Production would use self-hosted runners in a VNet with private endpoints. |
+| CKV_AZURE_134 | Azure OpenAI with no public network path | Same reason: the AI remediation job calls the model from a hosted runner |
+| CKV_AZURE_247 | Azure OpenAI outbound access restricted with an FQDN allow-list | False positive: outbound is restricted with an empty allow-list, which is stricter than the check accepts |
+| CKV2_AZURE_40 | Storage shared key auth disabled | The azurerm provider reads some storage settings with shared key auth |
+| CKV_AZURE_206 | Geo-redundant storage | Lab cost |
+| CKV2_AZURE_1, CKV2_AZURE_22 | Customer-managed keys | Lab scope; Microsoft-managed keys are used |
+| CKV_AZURE_33 | Queue service logging | No queues are used |
+| CKV2_AZURE_21 | Blob read logging through Log Analytics storage insights | Logging is on through a diagnostic setting (step 9). The check only recognizes storage insights, which takes the storage account key as an argument and puts it in Terraform state. |
+
+Running it locally before pushing:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install checkov==3.3.29
+checkov --directory terraform --config-file .checkov.yaml
+```
+
+### 6. The pipeline
+
+[`.github/workflows/terraform.yml`](.github/workflows/terraform.yml) has four jobs:
+
+| Job | Runs when | What it does |
+|---|---|---|
+| `Checkov security scan` | Every push, PR, and manual run | Blocking scan. Uploads SARIF to code scanning and saves JSON for the AI job. |
+| `AI remediation comment` | Scan **fails** on a PR | Signs in with OIDC, asks Azure OpenAI for a fix per unique check, posts or updates one PR comment |
+| `Terraform plan` | Scan **passes** | `fmt -check`, `init`, `validate`, `plan -out=main.tfplan`. Comments the plan on PRs and saves it as an artifact on `main`. |
+| `Terraform apply` | Push to `main`, when the plan has changes | Waits for my approval on the `dev` environment, then applies the saved plan |
+
+The apply job applies the exact plan file I reviewed rather than re-planning. A `concurrency` group keeps two runs from fighting over the state lock. The plan step uses `-detailed-exitcode`, so a merge with no infrastructure changes skips the apply instead of asking for an approval.
+
+### 7. First deploy
+
+```powershell
+git add .
+git status   # confirm no terraform.tfvars, state, .tfplan, or .venv files are staged
+git commit -m "feat: initial DevSecOps pipeline, Terraform, and bootstrap"
 git push -u origin main
+gh run watch
 ```
 
-### Step 2: Create the remote state bucket
+The scan and plan pass, and then the apply job waits for review. I approved it in GitHub under Actions → the run → Review deployments.
 
-Terraform can't store state in a bucket that doesn't exist yet, so the state bucket is created once by hand.
+![Apply job waiting for approval on the dev environment](screenshots/07-apply-waiting.png)
 
-```bash
-aws s3api create-bucket --bucket <your-state-bucket> --region us-east-1
-aws s3api put-bucket-versioning --bucket <your-state-bucket> \
-  --versioning-configuration Status=Enabled
+![Approving the dev deployment after reviewing the plan](screenshots/07-review-deployment.png)
+
+![Successful run with scan, plan, and apply green](screenshots/07-run-success.png)
+
+![Apply complete: 4 added](screenshots/07-apply-complete.png)
+
+![Deployed resources in rg-devsecops-anthonycleveland-dev](screenshots/07-resource-group.png)
+
+The AI remediation job needs to know where the model lives, so I stored the Terraform outputs as repository variables:
+
+```powershell
+cd terraform
+gh variable set AZURE_OPENAI_ENDPOINT --body (terraform output -raw openai_endpoint)
+gh variable set AZURE_OPENAI_DEPLOYMENT --body (terraform output -raw openai_deployment_name)
+cd ..
 ```
 
-### Step 3: Write the Terraform code
+![Azure OpenAI Keys and Endpoint: API key authentication is disabled](screenshots/07-openai-keys-disabled.png)
 
-All files live in `terraform/foundation/`.
+![Azure OpenAI resource JSON: disableLocalAuth true, restrictOutboundNetworkAccess true, empty allowedFqdnList](screenshots/07-openai-json.png)
 
-**backend.tf**: stores state in S3, with native S3 locking (no DynamoDB table needed).
+### 8. Branch protection
+
+With the job names registered by the first run, I required both checks on `main`:
+
+```powershell
+$protection = @{
+    required_status_checks        = @{ strict = $true; contexts = @('Checkov security scan', 'Terraform plan') }
+    enforce_admins                = $false
+    required_pull_request_reviews = @{ required_approving_review_count = 0 }
+    restrictions                  = $null
+} | ConvertTo-Json -Depth 5
+$protectionFile = Join-Path $env:TEMP 'protection.json'
+[System.IO.File]::WriteAllText($protectionFile, $protection)
+gh api --method PUT repos/anthonycleveland/azure-terraform-devsecops-pipeline/branches/main/protection --input $protectionFile
+Remove-Item $protectionFile
+```
+
+### 9. Break and fix: watching the gate work
+
+On a feature branch, I added a real change (a private `reports` container) and slipped in a misconfiguration at the same time:
 
 ```hcl
-terraform {
-  backend "s3" {
-    bucket       = "<your-state-bucket>"
-    key          = "foundation/terraform.tfstate"
-    region       = "us-east-1"
-    encrypt      = true
-    use_lockfile = true
+resource "azurerm_storage_container" "reports" {
+  name                  = "reports"
+  storage_account_id    = azurerm_storage_account.workload.id
+  container_access_type = "private"
+}
+```
+
+```hcl
+  allow_nested_items_to_be_public = true   # the misconfiguration
+```
+
+```powershell
+git checkout -b feature/reports-container
+git add terraform/main.tf
+git commit -m "feat: add reports container"
+git push -u origin feature/reports-container
+gh pr create --fill
+```
+
+What happened:
+
+1. **The gate failed with three findings, not one.** CKV_AZURE_190 and CKV2_AZURE_47 flagged the public-access setting. CKV2_AZURE_21 flagged the new container, because it wants blob read logging. `Terraform plan` never ran.
+2. **The findings appeared in code scanning** on the PR.
+3. **The AI remediation job posted a comment, and the first version was useless.** It invented resource names like `examplestorageacct`. The cause was that Checkov's JSON output had an empty `code_block` for every finding, so the model never saw my code.
+4. **I fixed the script in a separate PR (#2).** It now reads the flagged lines straight from the repo and tells the model it targets azurerm 4.x. After that, the CKV_AZURE_190 suggestion was correct (`allow_nested_items_to_be_public = false`). The other two still invented things: an argument azurerm removed, and a resource that doesn't exist. That's exactly why the pipeline posts suggestions as comments for a human to review instead of committing them.
+5. **I fixed the public-access setting** by setting `allow_nested_items_to_be_public = false`.
+6. **I added blob logging the current way.** CKV2_AZURE_21 only accepts `azurerm_log_analytics_storage_insights`, which takes the storage account key as an argument and stores it in Terraform state. Instead, I added a Log Analytics workspace and a diagnostic setting on the blob service, and documented the skip in `.checkov.yaml`:
+
+```hcl
+resource "azurerm_monitor_diagnostic_setting" "blob_logs" {
+  name                       = "blob-to-log-analytics"
+  target_resource_id         = "${azurerm_storage_account.workload.id}/blobServices/default"
+  log_analytics_workspace_id = azurerm_log_analytics_workspace.logs.id
+
+  enabled_log {
+    category = "StorageRead"
+  }
+  enabled_log {
+    category = "StorageWrite"
+  }
+  enabled_log {
+    category = "StorageDelete"
   }
 }
 ```
 
-**versions.tf**: pins Terraform and providers, and applies default tags to every resource.
+7. **The scan passed and the change shipped.** The plan comment showed 3 to add: the container, the workspace, and the diagnostic setting. I merged, approved the `dev` deployment, and all three were created.
 
-```hcl
-terraform {
-  required_version = ">= 1.10.0"
-  required_providers {
-    aws    = { source = "hashicorp/aws", version = "~> 6.0" }
-    random = { source = "hashicorp/random", version = "~> 3.6" }
-  }
-}
+![Checkov gate failing on the PR, with plan skipped](screenshots/09-failed-gate.png)
 
-provider "aws" {
-  region = var.region
-  default_tags { tags = var.tags }
-}
+![AI remediation comment before grounding, with invented resource names](screenshots/09-ai-comment-before.png)
+
+![AI remediation comment after grounding](screenshots/09-ai-comment-after.png)
+
+![Checkov finding shown inline on the PR by code scanning](screenshots/09-code-scanning-alert.png)
+
+![Plan after the fix: 3 to add](screenshots/09-plan-after-fix.png)
+
+![Blob diagnostic setting sending logs to Log Analytics](screenshots/09-blob-diagnostic-setting.png)
+
+### 10. Calling the model (optional)
+
+[`app/main.py`](app/main.py) is a small FastAPI wrapper that uses my `az login` session to get a token, so no key is involved here either:
+
+```powershell
+cd app
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+$env:AZURE_OPENAI_ENDPOINT = (terraform "-chdir=..\terraform" output -raw openai_endpoint)
+$env:AZURE_OPENAI_DEPLOYMENT = (terraform "-chdir=..\terraform" output -raw openai_deployment_name)
+uvicorn main:app --reload
 ```
 
-**variables.tf**: reusable inputs.
+In a second terminal:
 
-```hcl
-variable "region" {
-  type    = string
-  default = "us-east-1"
-}
-
-variable "prefix" {
-  type    = string
-  default = "oaip"
-}
-
-variable "environment" {
-  type    = string
-  default = "dev"
-}
-
-variable "tags" {
-  type = map(string)
-  default = {
-    Environment = "dev"
-    ManagedBy   = "Terraform"
-    Project     = "Open-Ai-Pipeline"
-  }
-}
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/chat `
+  -ContentType 'application/json' `
+  -Body (@{ message = 'In one sentence, why use OIDC instead of a client secret in CI/CD?' } | ConvertTo-Json) | Format-List
 ```
 
-**main.tf**: a lab S3 bucket. The public access block is intentionally turned off so the scanner and the AI have something to catch.
+![FastAPI /chat endpoint answering through Azure OpenAI with Entra token auth](screenshots/10-api-response.png)
 
-```hcl
-resource "random_id" "suffix" {
-  byte_length = 4
-}
+## Verification Checklist
 
-resource "aws_s3_bucket" "lab" {
-  bucket = "${var.prefix}-${var.environment}-${random_id.suffix.hex}"
-}
+- [ ] App registration has three federated credentials and zero client secrets
+- [ ] Pipeline identity has roles only on the workload resource group and the state storage account
+- [ ] State storage account has shared key access disabled, and state is written through Entra auth
+- [ ] `.terraform.lock.hcl` is committed with Windows and Linux hashes
+- [ ] Push to `main` runs scan → plan → apply, and apply waits for approval
+- [ ] Azure OpenAI account shows local auth disabled; the model deployment `chat` exists
+- [ ] Checkov SARIF results appear in the Security tab under code scanning
+- [ ] The break/fix PR was blocked by the gate, received an AI remediation comment, and passed after the fix
+- [ ] The blob diagnostic setting sends StorageRead, StorageWrite, and StorageDelete logs to the Log Analytics workspace
+- [ ] A merge with no infrastructure changes skips the apply instead of waiting for approval
+- [ ] The plan comment on the PR updates in place rather than duplicating
+- [ ] Branch protection requires `Checkov security scan` and `Terraform plan`
+- [x] The FastAPI `/chat` endpoint returns a response using token auth
 
-# INTENTIONAL VULNERABILITY for the Checkov exercise
-resource "aws_s3_bucket_public_access_block" "lab" {
-  bucket                  = aws_s3_bucket.lab.id
-  block_public_acls       = false
-  block_public_policy     = false
-  ignore_public_acls      = false
-  restrict_public_buckets = false
-}
+## Troubleshooting
+
+| Issue | Cause | Fix |
+|---|---|---|
+| First pipeline run failed at `terraform init` with `AADSTS700213: No matching federated identity record found` | Repos created after mid-2026 get GitHub's immutable OIDC subject (`repo:owner@ownerId/repo@repoId:...`), but the federated credentials used the old name-only format | Read the owner and repo IDs from the GitHub API in the bootstrap, and update the three federated credentials to the immutable format |
+| Checkov failed CKV2_AZURE_41 (SAS expiration policy) even though `sas_policy` was set | The check reads only the config, and requires `shared_access_key_enabled` to be written explicitly. The provider default of `true` doesn't count. | Set `shared_access_key_enabled = true` explicitly, which changes nothing in Azure |
+| Checkov failed CKV_AZURE_247 with outbound access already restricted | The check requires a non-empty `fqdns` allow-list, so an empty list (the strictest setting) fails | Kept the empty allow-list and documented the check as a false positive in `.checkov.yaml` |
+| Checkov failed CKV2_AZURE_21 after adding a blob container | The check only accepts `azurerm_log_analytics_storage_insights`, which puts the storage account key in Terraform state | Added a Log Analytics workspace and a blob diagnostic setting instead, and documented the skip |
+| The AI remediation comment invented resource names | Checkov's JSON output had an empty `code_block` for every finding, so the model never saw the real code | The script reads the flagged lines from the repo using `repo_file_path` and `file_line_range` |
+| AI suggestions used a removed argument and a nonexistent resource, even after grounding | Model hallucination: a small model doesn't reliably know the azurerm 4.x schema | Suggestions are posted as comments for human review, never applied automatically |
+| Every merge to `main` asked for an apply approval, even with no changes | The apply job ran on every push to `main`, and while it waited for approval the concurrency group blocked other runs | Use `terraform plan -detailed-exitcode` and skip apply when the plan has no changes |
+| GlobalStandard quota for `gpt-4.1-mini` didn't show up in `az cognitiveservices usage list` | The quota is listed as `OpenAI.GlobalStandard.gpt4.1-mini`, with no hyphen after `gpt` | List all GlobalStandard entries and match on that name |
+| Code scanning alerts API returned nothing for the PR | The API defaults to the default branch | Query with `?ref=refs/pull/<number>/merge` |
+| README emoji turned into mojibake (`ðŸ“¸`) after a PowerShell edit | Windows PowerShell 5.1 read the UTF-8 file as Windows-1252 and wrote it back double-encoded | Edit files with an editor or tool that preserves UTF-8, and check for a BOM or mojibake before committing |
+| `terraform -chdir=..\terraform output` failed with "Invalid -chdir option" in PowerShell | Windows PowerShell 5.1 splits an argument like `-chdir=..\terraform`, where a dot follows the `=`, into two arguments | Quote the whole argument: `terraform "-chdir=..\terraform" output ...` |
+
+## Cleanup
+
+```powershell
+cd terraform
+$openAiName = terraform output -raw openai_account_name
+terraform destroy
+# Azure OpenAI accounts are soft-deleted; purge so the name and quota are released
+az cognitiveservices account purge --name $openAiName --resource-group rg-devsecops-anthonycleveland-dev --location eastus2
+cd ..
+az group delete --name rg-devsecops-anthonycleveland-dev --yes
+az group delete --name rg-tfstate-anthonycleveland --yes
+$appId = az ad app list --display-name github-actions-devsecops-pipeline --query "[0].appId" -o tsv
+az ad app delete --id $appId
 ```
 
-**outputs.tf**
+The repo secrets are left in place. They point at a deleted app registration, so they grant nothing.
 
-```hcl
-output "bucket_name" {
-  value = aws_s3_bucket.lab.bucket
-}
+## Key Takeaways
 
-output "bucket_arn" {
-  value = aws_s3_bucket.lab.arn
-}
-```
+- **OIDC removes the secret, but the subject claim is strict.** A job in a GitHub environment presents `environment:dev` instead of the branch ref, and PRs present `pull_request`. New repos also embed immutable owner and repo IDs in the subject, so my first run failed with AADSTS700213 until the federated credentials matched the exact format GitHub sends.
+- **Least privilege changes the Terraform design.** Scoping the pipeline to one resource group meant pre-creating that group, reading it as a data source, and turning off automatic provider registration.
+- **A security gate is only real if it can fail.** An advisory scan is easy to ignore. A blocking scan forces every exception to be written down with a reason, and that list becomes documentation.
+- **"No stored credentials" has to hold everywhere.** That meant OIDC into Azure, Entra auth for state, and local auth disabled on Azure OpenAI. Keyless auth removed the need for a Key Vault to hold an API key.
+- **Scanners have blind spots, so read the check's source.** Three findings in this build only made sense after reading the check code. One penalized a stricter setting (CKV_AZURE_247). One ignored a provider default (CKV2_AZURE_41). One only accepts a logging mechanism that puts a storage key in state (CKV2_AZURE_21).
+- **AI suggestions need grounding and a reviewer.** Without the real code, the model invented resources. With it, the model got one fix right but still invented an argument and a resource for the others. That's why it comments rather than commits.
+- **Apply what was reviewed.** Saving the plan as an artifact and applying that file means the approved change is the one that ships. Skipping apply when nothing changed keeps approvals meaningful.
 
-Check and deploy locally:
+---
 
-```bash
-terraform init      # connect to the S3 backend, download providers
-terraform fmt       # auto-format
-terraform validate  # check for errors without creating anything
-terraform plan -out=tfplan
-terraform apply tfplan
-```
-
-### Step 4: Set up OIDC between GitHub and AWS
-
-OIDC lets the pipeline get short-lived AWS credentials at runtime. AWS trusts GitHub as an identity provider, and an IAM role's trust policy decides which repo is allowed in.
-
-Create the identity provider:
-
-```bash
-aws iam create-open-id-connect-provider \
-  --url https://token.actions.githubusercontent.com \
-  --client-id-list sts.amazonaws.com
-```
-
-Create `trust.json` (outside the repo). GitHub may send the `sub` claim with numeric owner and repo IDs, so the policy accepts both formats:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Principal": {
-      "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
-    },
-    "Action": "sts:AssumeRoleWithWebIdentity",
-    "Condition": {
-      "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-      "StringLike": {
-        "token.actions.githubusercontent.com:sub": [
-          "repo:<your-user>@<OWNER_ID>/Open-Ai-Pipeline@<REPO_ID>:*",
-          "repo:<your-user>/Open-Ai-Pipeline:*"
-        ]
-      }
-    }
-  }]
-}
-```
-
-Create the role and give it permissions:
-
-```bash
-aws iam create-role --role-name github-actions-oaip \
-  --assume-role-policy-document file://trust.json
-
-aws iam attach-role-policy --role-name github-actions-oaip \
-  --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-```
-
-> The `sub` condition is what limits the role to this repo. Without it, any GitHub repo could assume the role.
-
-### Step 5: Set up OpenAI
-
-1. In the OpenAI dashboard, add a small prepaid credit and turn off auto-recharge, so a leaked key can only spend what's loaded.
-2. Create a project for this pipeline and a project-scoped API key.
-
-### Step 6: Add GitHub secrets
-
-Repo → Settings → Secrets and variables → Actions → New repository secret
-
-| Secret | Source |
-| --- | --- |
-| `AWS_ROLE_ARN` | `arn:aws:iam::<ACCOUNT_ID>:role/github-actions-oaip` |
-| `OPENAI_API_KEY` | OpenAI dashboard → project → API keys |
-
-`GITHUB_TOKEN` is created automatically by GitHub for every run. No AWS access keys are stored.
-
-### Step 7: Write the pipeline
-
-`.github/workflows/terraform.yml`
-
-```yaml
-name: Terraform Pipeline
-
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  pull-requests: write     # lets the bot comment on the PR
-  security-events: write   # uploads Checkov results to GitHub Security
-  id-token: write          # requests the OIDC token for AWS
-
-env:
-  TF_VERSION: "1.10.5"
-  WORKING_DIR: "terraform/foundation"
-  AWS_REGION: "us-east-1"
-  AI_MODEL: "gpt-4o-mini"
-
-jobs:
-  # ── JOB 1: Security Scan ─────────────────────────────
-  scan:
-    name: Checkov Security Scan
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run Checkov
-        uses: bridgecrewio/checkov-action@v12
-        with:
-          directory: ${{ env.WORKING_DIR }}
-          framework: terraform
-          output_format: cli,sarif,json
-          output_file_path: console,results.sarif,results.json
-
-      - name: Upload SARIF to GitHub Security
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: results.sarif
-
-      - name: Upload Checkov JSON for AI step
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: checkov-results
-          path: results.json
-          if-no-files-found: ignore
-
-  # ── JOB 2: AI Remediation (only when scan fails on a PR) ──
-  ai-remediation:
-    name: AI Security Remediation
-    runs-on: ubuntu-latest
-    needs: [scan]
-    if: failure() && github.event_name == 'pull_request'
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Download Checkov results
-        uses: actions/download-artifact@v4
-        with:
-          name: checkov-results
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run AI Remediation
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: python scripts/remediate_ai.py
-
-  # ── JOB 3: Terraform Plan / Apply ────────────────────
-  deploy:
-    name: Terraform Deploy
-    runs-on: ubuntu-latest
-    needs: [scan]
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-
-      - name: AWS Login via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Terraform Init
-        working-directory: ${{ env.WORKING_DIR }}
-        run: terraform init
-
-      - name: Terraform Format Check
-        working-directory: ${{ env.WORKING_DIR }}
-        run: terraform fmt -check -recursive
-
-      - name: Terraform Validate
-        working-directory: ${{ env.WORKING_DIR }}
-        run: terraform validate
-
-      - name: Terraform Plan
-        working-directory: ${{ env.WORKING_DIR }}
-        run: terraform plan -out=tfplan
-
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        working-directory: ${{ env.WORKING_DIR }}
-        run: terraform apply -auto-approve tfplan
-```
-
-### Step 8: Write the AI reviewer
-
-`requirements.txt`
-
-```
-openai>=1.50.0
-requests>=2.32.0
-```
-
-`scripts/remediate_ai.py` reads Checkov's real findings, deduplicates them by check ID, asks OpenAI for a fix for each (up to 5), and posts one PR comment.
-
-Key parts:
-
-```python
-from openai import OpenAI
-
-client = OpenAI()  # reads OPENAI_API_KEY from the environment
-
-def get_ai_fix(check_id, resource, file_path, guideline):
-    prompt = (
-        f"Checkov check {check_id} failed on resource '{resource}' in {file_path}.\n"
-        f"Guideline: {guideline}\n\n"
-        "Give a concise Terraform HCL fix for AWS."
-    )
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": "You are a DevSecOps engineer specializing in Terraform and AWS security. Be concise."},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=600,
-            temperature=0.1,
-            timeout=30,
-        )
-        return resp.choices[0].message.content
-    except Exception as e:
-        print(f"OpenAI error for {check_id}: {e}")
-        return None
-```
-
-The script then posts the result to the PR using the GitHub REST API: `POST https://api.github.com/repos/{repo}/issues/{pr_number}/comments`
-
-### Step 9: Test with a feature branch
-
-```bash
-git checkout -b feature/add-pipeline
-git add .github scripts requirements.txt
-git commit -m "ci: add terraform pipeline with checkov gate and ai remediation"
-git push -u origin feature/add-pipeline
-```
-
-On GitHub: **Pull requests → New pull request** → base: `main`, compare: `feature/add-pipeline`.
-
-The pipeline runs automatically. The scan fails on the intentional vulnerability, deploy is skipped, and the github-actions bot posts the AI suggestions in the **Conversation** tab. Full findings appear under **Security → Code scanning**.
-
-## How the Pipeline Works
-
-1. A PR is opened against `main`, which triggers the pipeline.
-2. **Scan:** Checkov scans `terraform/foundation`. Results go to the log, to GitHub Security (SARIF), and to a JSON artifact.
-3. **If the scan fails:** deploy is blocked (`needs: [scan]`). On PRs, the AI job downloads the JSON, sends each unique finding to OpenAI, and posts the suggested fixes as a PR comment.
-4. **If the scan passes:** deploy assumes the IAM role through OIDC, then runs `init`, `fmt -check`, `validate`, and `plan`.
-5. **After merge to `main`:** the same flow runs on the push, and `terraform apply` deploys the saved plan to AWS.
-
-## Result
-
-Checkov flagged 11 findings on the lab bucket: the four public access block settings that were turned off on purpose, plus general S3 hardening checks (versioning, KMS encryption, access logging, lifecycle configuration, event notifications, cross-region replication).
-
-The AI comment correctly suggested the fix for the public access block:
-
-```hcl
-resource "aws_s3_bucket_public_access_block" "lab" {
-  bucket                  = aws_s3_bucket.lab.id
-  block_public_acls       = true
-  ignore_public_acls      = true
-  block_public_policy     = true
-  restrict_public_buckets = true
-}
-```
-
-It also got one finding wrong. For `CKV2_AWS_61` (lifecycle configuration), it suggested an S3 logging block in outdated syntax. That's a clear example of why the AI only suggests and a human reviews before merging.
-
-## Troubleshooting Log
-
-Real issues hit while building this project and how they were solved.
-
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| `zsh: command not found: code` | VS Code shell command not in PATH | VS Code → Cmd+Shift+P → *Shell Command: Install 'code' command in PATH* |
-| `Set-Alias: command not found` | `Set-Alias` is PowerShell; the Mac terminal runs zsh | `alias tf='terraform'`, added to `~/.zshrc` |
-| `terraform init`: "initialized in an empty directory" | Ran from `terraform/` instead of `terraform/foundation/` | `cd foundation`, then init |
-| `fatal: 'origin' does not appear to be a git repository` | Remote was added with a typo (`orgin`) | `git remote rename orgin origin` |
-| `pathspec 'requirements.txt' did not match any files` | File was never created, so `git add` staged nothing | Create the file, then rerun `git add` |
-| `gh: command not found` after `pip3 install gh` | The pip package `gh` is unrelated to the GitHub CLI | `pip3 uninstall gh`, then `brew install gh` or use the GitHub website |
-| `.gitignore` exception not working | Inline comment on the `!terraform.tfvars.example` line | Move comments to their own line |
-| OIDC: `Not authorized to perform sts:AssumeRoleWithWebIdentity` | GitHub sent `sub` with numeric IDs (`owner@id/repo@id`), which didn't match the trust policy | Found the real `sub` in CloudTrail, added it to the trust policy |
-| Bedrock: `ThrottlingException: Too many tokens per day` | New AWS account had 0 Bedrock quota for every model; increase request was rejected | Switched the AI step to the OpenAI API |
-| AI comment posted but empty ("...and 6 more" only) | Every AI call failed, and the script skipped failed findings silently | Read the job log, fixed the provider |
-| AI suggested the wrong fix for `CKV2_AWS_61` | Script sent only the check ID, so the model guessed what it meant | Pass Checkov's `check_name` into the prompt |
-
-## Lessons Learned
-
-- **Pipelines should fail loudly.** An AI step that passed with an empty comment hid the real error.
-- **CloudTrail answers OIDC errors.** The rejected event showed the exact `sub` claim GitHub sent, which solved the problem in one step.
-- **New cloud accounts often start with zero AI quota.** Both Bedrock and Azure OpenAI can restrict new accounts, so check quota before designing around a provider.
-- **AI suggestions need review.** Give the model full context (check name, not just ID), and treat its output as a draft.
-- **Names must match exactly.** Remote names, repo names in trust policies, and bucket names in `backend.tf` are all exact matches.
-- **`.gitignore` goes in before the first Terraform file.** State, plans, and tfvars never reach GitHub.
-
-## Next Improvements
-
-- [ ] Fix the remaining Checkov findings, or skip lab-irrelevant ones (replication, event notifications) with a documented reason
-- [ ] Pass `check_name` to the AI prompt and group findings by resource to avoid repeated fixes
-- [ ] Pin `checkov-action` to an exact release instead of a major version tag
-- [ ] Replace `AmazonS3FullAccess` with a least-privilege policy scoped to the two buckets
-- [ ] Manage the OIDC provider and IAM role in Terraform instead of the CLI
-- [ ] Manual approval before apply, using a GitHub Environment with required reviewers
-- [ ] Post the `terraform plan` summary in the PR alongside the AI review
-- [ ] Move the workflow into the reusable Central-Pipeline repo so all projects share it
-- [ ] Switch the AI step to Amazon Bedrock once quota is approved
-
-## Author
-
-Anthony J. Cleveland, Cloud Engineer
-GitHub: [@clevelandjosiah](https://github.com/clevelandjosiah)
+Built by **Anthony Cleveland** · Cloud Engineer · [github.com/clevelandjosiah](https://github.com/clevelandjosiah)

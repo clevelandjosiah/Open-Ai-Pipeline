@@ -500,15 +500,19 @@ cd ../..
 # The state bucket is versioned: empty it in the S3 console (which removes all versions), then delete it
 aws s3api delete-bucket --bucket openai-tfstate --region us-east-1
 
+# A role can't be deleted while policies are attached to it
 aws iam detach-role-policy --role-name github-actions-oaip \
   --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
-aws iam delete-role-policy --role-name github-actions-oaip --policy-name bedrock-invoke
+for p in $(aws iam list-role-policies --role-name github-actions-oaip --query 'PolicyNames' --output text); do
+  aws iam delete-role-policy --role-name github-actions-oaip --policy-name "$p"
+done
 aws iam delete-role --role-name github-actions-oaip
+
 aws iam delete-open-id-connect-provider \
   --open-id-connect-provider-arn arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com
 ```
 
-Skip the `bedrock-invoke` line if that policy was already removed. Revoke the OpenAI API key in the OpenAI dashboard. The `AWS_ROLE_ARN` secret can stay, since it points at a deleted role and grants nothing.
+The loop removes any inline policies left on the role, so `delete-role` doesn't fail. Revoke the OpenAI API key in the OpenAI dashboard. The `AWS_ROLE_ARN` secret can stay, since it points at a deleted role and grants nothing.
 
 ## Key Takeaways
 

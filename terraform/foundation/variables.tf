@@ -19,5 +19,6 @@ variable "tags" {
     Environment = "dev"
     ManagedBy   = "Terraform"
     Project     = "Open-Ai-Pipeline"
+    Owner       = "clevelandjosiah"
   }
 }

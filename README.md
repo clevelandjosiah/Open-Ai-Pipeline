@@ -10,8 +10,6 @@
 
 I built a GitHub Actions pipeline that deploys AWS infrastructure with Terraform behind a real security gate. Every pull request is scanned by Checkov before Terraform is allowed to plan. Findings go to GitHub code scanning as SARIF, and failing PRs get an AI-generated remediation comment from the OpenAI API. Pushes to `main` run the same gate, and `terraform apply` only runs on `main` after the scan passes.
 
-The project started from a 3-day Azure bootcamp guide. I rebuilt it on AWS, which meant replacing Azure login with AWS OIDC, Azure Blob state with S3 state, and Azure OpenAI with a different AI provider.
-
 How credentials are handled:
 
 - **GitHub to AWS:** GitHub Actions authenticates with OIDC and assumes an IAM role, so no AWS access keys exist anywhere.

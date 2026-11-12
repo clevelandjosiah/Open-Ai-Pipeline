@@ -231,7 +231,7 @@ git push
 
 `terraform init` printed "Successfully configured the backend "s3"!", and the state file appeared in the state bucket. Before the pipeline existed, I applied once locally to confirm the backend and providers worked. The plan created 3 resources: `random_id`, `aws_s3_bucket`, and the public access block. From here on, the pipeline owns every apply.
 
-![Terraform plan: 3 to add, 0 to change, 0 to destroy](screenshots/04-plan-summary.png)
+![Terraform plan in the pipeline: 4 to add, 0 to change, 0 to destroy](screenshots/04-plan-summary.png)
 
 ![State file in the S3 state bucket](screenshots/04-state-bucket.png)
 

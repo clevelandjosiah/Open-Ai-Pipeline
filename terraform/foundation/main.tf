@@ -6,7 +6,7 @@ resource "aws_s3_bucket" "lab" {
   bucket = "${var.prefix}-${var.environment}-${random_id.suffix.hex}"
 }
 
-# INTENTIONAL VULNERABILITY 
+# INTENTIONAL VULNERABILITY
 resource "aws_s3_bucket_public_access_block" "lab" {
   bucket                  = aws_s3_bucket.lab.id
   block_public_acls       = false

@@ -265,8 +265,6 @@ On the lab bucket it reported 11 findings:
 | CKV2_AWS_62 | Event notifications | Skipped: no downstream consumers |
 | CKV_AWS_144 | Cross-region replication | Skipped: out of scope for a single-region lab |
 
-```
-
 ### 6. The pipeline
 
 [`.github/workflows/terraform.yml`](.github/workflows/terraform.yml) has three jobs:

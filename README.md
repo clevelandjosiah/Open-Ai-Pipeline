@@ -32,27 +32,12 @@ How credentials are handled:
 
 ```mermaid
 flowchart LR
-    dev[Developer] -->|push or PR| gh[GitHub repository]
-    gh --> scan[Checkov security gate]
-    scan -->|SARIF| cs[GitHub code scanning]
-    scan -->|results.json artifact| ai[AI remediation job]
-    ai -->|fails on PR| oai[OpenAI API<br/>gpt-4o-mini]
-    oai -->|suggested fixes| ai
-    ai -->|PR comment| pr[Pull request]
-    scan -->|passes| plan[Terraform init, fmt,<br/>validate, plan]
-    plan -->|push to main only| apply[Terraform apply]
-
-    subgraph AWS[AWS us-east-1]
-        role[IAM role<br/>github-actions-oaip]
-        state[(S3 state bucket<br/>versioned, use_lockfile)]
-        lab[S3 lab bucket<br/>oaib-dev-cae28e44]
-    end
-
-    plan -->|OIDC| role
-    apply -->|OIDC| role
-    plan --> state
-    apply --> state
-    apply --> lab
+    pr[Pull request] --> scan{Checkov<br/>security scan}
+    scan -->|Findings| sec[GitHub Security tab]
+    scan -->|Fail| ai[OpenAI posts<br/>fixes on the PR]
+    scan -->|Pass| plan[Terraform plan]
+    plan -->|Merge to main| apply[Terraform apply]
+    apply -->|OIDC, no stored keys| aws[(AWS)]
 ```
 
 ## Prerequisites
